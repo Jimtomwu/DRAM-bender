@@ -1,0 +1,84 @@
+**✅ 在 VS Code 中使用 Claude Code + DeepSeek API**
+
+Claude Code 在 VS Code 中有**官方扩展**，支持通过环境变量接入 DeepSeek（Anthropic 兼容模式）。
+
+### 第一步：安装 Claude Code VS Code 扩展
+
+1. 打开 VS Code。
+2. 按 `Ctrl + Shift + X` 打开扩展面板。
+3. 搜索 **Claude Code**（官方扩展，由 Anthropic 发布）。
+4. 点击 **Install** 安装。
+
+### 第二步：配置 DeepSeek API（最重要）
+
+1. 打开 VS Code 设置（`Ctrl + ,`）。
+2. 在搜索框中输入：`claude-code.environmentVariables`
+3. 点击 **Edit in settings.json**（在右侧）。
+4. 把下面内容**替换或添加到** `settings.json` 中：
+
+```json
+"claude-code.environmentVariables": [
+  {
+    "name": "ANTHROPIC_BASE_URL",
+    "value": "https://api.deepseek.com/anthropic"
+  },
+  {
+    "name": "ANTHROPIC_AUTH_TOKEN",
+    "value": "sk-你的DeepSeek_API_Key"
+  },
+  {
+    "name": "ANTHROPIC_API_KEY",
+    "value": "sk-你的DeepSeek_API_Key"
+  },
+  {
+    "name": "ANTHROPIC_MODEL",
+    "value": "deepseek-v4-pro[1m]"
+  },
+  {
+    "name": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "value": "deepseek-v4-pro[1m]"
+  },
+  {
+    "name": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "value": "deepseek-v4-flash"
+  },
+  {
+    "name": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "value": "deepseek-v4-flash"
+  },
+  {
+    "name": "CLAUDE_CODE_SUBAGENT_MODEL",
+    "value": "deepseek-v4-flash"
+  }
+]
+```
+
+**把 `sk-你的DeepSeek_API_Key` 换成你自己的 Key**。
+
+5. 保存 `settings.json`，然后**重启 VS Code**。
+
+### 第三步：使用
+
+- 打开你的项目文件夹。
+- 在左侧侧边栏找到 **Claude Code** 图标（可能是一个 C 形状的图标）。
+- 点击 **New Session** 开始新会话。
+- 或者直接在终端中使用 `claude` 命令（环境变量会自动生效）。
+
+---
+
+### 推荐模型（DeepSeek）：
+
+- **deepseek-v4-pro[1m]** → 最强，适合复杂 Agent 任务（类似 Opus）
+- **deepseek-v4-flash** → 更快、更便宜，日常使用推荐
+
+---
+
+**常见问题解决**：
+
+- **还是弹出登录界面** → 确保 `claudeCode.disableLoginPrompt` 设置为 `true`（在设置中搜索）。
+- **API 调用失败** → 检查 Key 是否正确，重启 VS Code。
+- **想快速切换 Claude / DeepSeek** → 可以安装扩展 **Claude Deepseek Switcher**（市场中搜索）。
+
+---
+
+现在试试看，配置完后告诉我是否能正常启动，或者出现什么错误，我继续帮你调试！
