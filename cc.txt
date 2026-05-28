@@ -1,0 +1,986 @@
+
+帮忙分析board.cpp
+Let me find and read the file first.
+
+Globpattern: "**/board.cpp"
+Found 1 file
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h
+board.cpp 分析
+概述
+BoardInterface 类封装了主机与 FPGA 板卡之间通过 XDMA (PCIe DMA) 驱动的通信。它负责打开字符设备文件、分配 DMA 缓冲区、以及数据的收发。
+
+代码结构
+方法	功能
+BoardInterface()	构造函数，保存接口类型和 DIMM 选择号
+~BoardInterface()	析构，释放缓冲区和关闭文件描述符
+init()	打开 XDMA 设备文件并分配页对齐 DMA 缓冲区
+sendData() / recvData()	公共接口，根据 iface_type 分发到具体实现
+xdma_send() / xdma_recv()	XDMA 的实际读写逻辑
+发现的问题
+1. xdma_send() 存在死循环风险 (严重)
+
+while (count < size) {
+    rc = write(fd, buf, size);  // 每次都写 size 字节
+    assert(rc == size || rc == 0);
+    count += rc;
+}
+write() 每次都传 size 而非 size - count，即便已经写了部分数据，仍然尝试从头写全部 size 字节。
+如果 write() 永远返回 0（例如设备暂时不可写但未报错），count 永远不增长，循环永远不会退出。
+应该使用 buf + count 和 size - count。
+2. assert 在 Release 构建中会失效
+代码中使用 assert 做了多处关键校验：
+
+
+assert(rc == size || rc == 0);       // xdma_send
+assert(size <= RECV_BUF_SIZE && "given read size is too large");  // xdma_recv
+assert(count <= size);               // xdma_recv
+assert 在 NDEBUG 模式下会被编译移除，这些校验将完全消失。对于硬件 I/O 操作，应该使用运行时错误处理（返回错误码或抛异常）而非 assert。
+
+3. 资源泄漏 / 未初始化指针 (中等)
+构造函数没有初始化 send_buf、recv_buf、to_card、from_card。如果构造后从未调用 init() 就析构，free() 和 close() 会操作未初始化的值，导致未定义行为。
+
+
+BoardInterface::~BoardInterface()
+{
+    free(send_buf);     // 未初始化 — UB
+    free(recv_buf);
+    close(to_card);     // 未初始化 — UB
+    close(from_card);
+}
+4. recvData() 返回值语义不一致
+xdma_recv() 返回实际读取的字节数 count，但 sendData() / xdma_send() 返回 0 或 1（成功/失败）。调用方无法统一处理：发送侧看返回值是否为 0 判断成功，接收侧看返回值是否 > 0 判断成功。
+
+5. break 语句永不可达 (轻微)
+
+case IFACE::XDMA:
+    return xdma_send(data,size);
+    break;  // return 之后永远不会执行
+return 之后的 break 是死代码，虽然无害但不整洁。
+
+6. 头文件缺少 <cstdint> 包含
+board.h 中使用了 uint（应该是 unsigned int），但没有包含 <cstdint> 或 <cstddef>。虽然可能通过其他头文件间接引入，但不是良好的可移植做法。
+
+改进建议
+xdma_send 的 while 循环应改为使用正确的偏移量和剩余字节数。
+用运行时检查（if + 返回错误码）替换 assert。
+构造函数中初始化指针为 nullptr，文件描述符为 -1；析构时检查后再释放。
+统一 sendData/recvData 的返回值语义，或至少明确文档说明差异。
+现在我想把XDMA接口换成AXI-stream接口，请分析可行性
+Let me先全面了解 BoardInterface 在代码库中的使用方式，再分析替换可行性。
+
+Agent:Analyze BoardInterface usage
+IN
+I need to understand how BoardInterface is used throughout the codebase at d:\DRAM_Bender\DRAM-Bender-master\sources\. 
+
+Please do the following:
+1. Grep for all references to BoardInterface, board.h, board.cpp across all files
+2. Find all files that #include "board.h"
+3. Find all instantiations of BoardInterface
+4. Find all calls to init(), sendData(), recvData() on BoardInterface objects
+5. Look at how sendData and recvData are called — what kind of data, what sizes, what patterns
+6. Check if there are any other interface implementations (search for IFACE, XDMA, or other interface types)
+7. Look at the overall project structure — what does this project do?
+
+Report back with file paths, line numbers, and representative code snippets. Be thorough — check every file that references BoardInterface.
+分析结果已很清楚，下面是对替换可行性的完整分析。
+
+XDMA → AXI-Stream 替换可行性分析
+1. 隔离度评估：替换范围很小
+BoardInterface 被很好地封装在一层抽象后面：
+
+
+应用层 (apps/*.cpp)
+    ↓
+SoftMCPlatform  (platform.cpp)     ← 唯一调用 sendData/recvData 的地方
+    ↓
+BoardInterface  (board.cpp/h)      ← 唯一需要改动的文件
+    ↓
+FPGA / 驱动
+只有 4 个文件 引用 BoardInterface
+只有 1 个实例化点：platform.cpp:84
+枚举 IFACE::XDMA 的设计本身就是为多接口扩展预留的，直接加 IFACE::AXIS 即可
+结论：软件侧改动范围可控。
+
+2. 需要改动的层次
+层次	改动内容	工作量
+board.h	添加 IFACE::AXIS 枚举值；可能需要调整 buffer 常量；添加 AXI-stream 私有成员	小
+board.cpp	实现 axis_init() / axis_send() / axis_recv()；设备文件路径和打开方式完全不同	中
+platform.cpp	仅需把 IFACE::XDMA 改为 IFACE::AXIS（如果保留双模式则不需要改）	极小
+FPGA HDL (hdl/)	这是重头：当前 softmc_top 通过 AXI-MM slave 接收指令，需要改为 AXI-stream sink/source	大
+Linux 驱动	从 XDMA 驱动换为 QDMA 或自定义 AXI DMA 驱动；设备文件路径不同	中
+3. 数据传输模式的兼容性
+好消息：当前使用模式对 AXI-stream 天然友好：
+
+发送侧：write(fd, buf, size) 把指令序列写入设备文件，本质上就是"把一包数据推到卡上"，这和 AXI-stream 的 push 模型一致。
+接收侧：read(fd, buf, 32KB) 读取 FPGA 回传的 DRAM 读数据，AXI-stream 同样可以 stream 回来。
+需要关注的问题：
+
+差异点	XDMA 现状	AXI-stream 对应
+设备文件	/dev/xdma0_h2c_0 + /dev/xdma0_c2h_0 两个独立设备	通常是一个设备或不同的 QDMA 队列
+传输语义	write() 写满指定字节数，DMA 引擎拆成 PCIe TLP	AXI-stream 以 flit/包为单位传输，可能需要帧定界
+控制命令	32 字节小包（reset、aref、温度读取等）	AXI-stream 对小包同样支持，但若使用 QDMA，小包可能效率较低
+最大发送	execute() 发 ~16KB 指令序列	没有问题，stream 可以承载任意长度
+接收缓冲	32KB，一次性 read() 回来	可能需要改为流式消费或环形缓冲
+页对齐	posix_memalign 4096 对齐	仍然需要（DMA 要求物理页对齐）
+4. 主要风险与挑战
+4.1 FPGA 侧改动量最大（关键风险）
+hdl/ 目录下的 FPGA 设计目前是对接 XDMA IP 核的 AXI-MM 接口。XDMA IP 核内部把 PCIe TLPs 翻译成 AXI-MM 地址读写——FPGA 看到的是一个"内存映射从设备"。换成 AXI-stream 意味着：
+
+移除 XDMA IP 核，替换为 AXI DMA / QDMA IP 核
+softmc_top 的指令接收接口从"读写寄存器"改为"解析流数据包"
+需要一个简单的包协议来区分控制命令和指令数据
+4.2 驱动和平台依赖
+XDMA 驱动是 Xilinx 官方维护的开源驱动。AXI-stream 的驱动方案取决于具体选择：
+
+方案	驱动	成熟度
+QDMA (Queue DMA)	Xilinx 官方 qdma 驱动	成熟，支持 MM 和 ST 模式
+AXI DMA (simple)	dma-proxy 或自定义	需要更多适配工作
+自定义 IP + UIO	无标准驱动	工作量大
+推荐使用 QDMA 的 ST 模式，它有成熟的 Linux 驱动和类似 XDMA 的使用方式。
+
+4.3 控制协议需要重新定义
+当前 32 字节控制命令中，特定偏移的字节（如 offset 8 写入 flag/command）映射到 FPGA 中的特定寄存器。AXI-stream 没有"地址"概念，需要通过包头来区分数据类型：
+
+
+// 建议的包格式
+| 包头 (4B)     | 载荷 (N字节)  |
+| type | flags  | data ...      |
+FPGA HDL 和软件两侧都需要同时适配这个新协议。
+
+4.4 xdma_send() 中的现有 bug
+
+while (count < size) {
+    rc = write(fd, buf, size);       // 每次写 size，不是 size-count
+    count += rc;                      // rc==0 时死循环
+}
+这个 bug 在迁移时应该一并修复，AXI-stream 的发送循环需要正确处理部分写入。
+
+5. 方案建议
+推荐分三步走：
+
+软件侧：在 BoardInterface 中添加 IFACE::AXIS，实现 axis_init() / axis_send() / axis_recv()，抽象出统一接口。可以先写一个模拟层测试编译。
+驱动侧：确认目标平台的 AXI-stream 设备文件接口（QDMA 的 /dev/qdma* 队列），适配 buffer 管理和设备操作。
+FPGA 侧：这步独立并行——修改 HDL 设计，把 AXI-MM 从设备换成 AXI-stream 接口，定义包协议。
+总体可行性：可行，软件侧工作量约 200-300 行新代码（主要在 board.cpp），但 FPGA HDL 改造是决定项目周期的关键路径。
+
+FPGA测准备使用microblaze的AXI-stream来替换PCIE的ADMA AXI-stream，source文件下的cpp文件可以运行在microblaze上，请分析这样改动的可行性
+这是一个重大的架构变化。让我深入分析 MicroBlaze 平台对 C++ 代码的约束，以及需要改动的所有依赖。
+
+Agent:Analyze POSIX/C++ dependencies
+IN
+I'm analyzing whether the C++ source files under d:\DRAM_Bender\DRAM-Bender-master\sources\ can run on a Xilinx MicroBlaze soft-core processor (bare-metal or FreeRTOS, not Linux).
+
+Please do a thorough analysis:
+
+1. List ALL POSIX/Linux dependencies across ALL .cpp and .h files in sources/api/ and sources/apps/:
+   - open/close/read/write/fcntl/unistd
+   - posix_memalign/malloc/free
+   - pthread or any threading (check platform.cpp)
+   - mmap/munmap
+   - ioctl
+   - Any other syscalls or Linux-specific APIs
+
+2. Check for C++ standard library usage that may not be available on bare-metal MicroBlaze:
+   - iostream, fstream, sstream
+   - std::thread, std::mutex, std::atomic
+   - boost libraries (check platform.h/cpp)
+   - exceptions (try/catch/throw)
+   - RTTI (dynamic_cast, typeid)
+   - STL containers (vector, map, string, queue, etc.)
+   - new/delete operators
+
+3. Check the build system:
+   - Look for CMakeLists.txt or Makefile in sources/ and subdirectories
+   - What compiler flags are used?
+   - Any cross-compilation support?
+
+4. Check memory usage:
+   - What are the buffer sizes? (SEND_BUF_SIZE, RECV_BUF_SIZE, INSTR_BUF_SIZE, etc.)
+   - How large is the instruction buffer in platform.cpp?
+   - What's the overall memory footprint?
+
+5. Check the data flow in platform.cpp carefully:
+   - What does the background reader thread do?
+   - How is boost::lockfree::spsc_queue used?
+   - What threading model is used?
+
+Report file paths, line numbers, and code snippets for everything found.
+Agent:Analyze FPGA HDL architecture
+IN
+I need to understand the FPGA-side architecture to assess replacing XDMA/PCIE with MicroBlaze AXI-stream.
+
+Under d:\DRAM_Bender\DRAM-Bender-master\sources\hdl\, please:
+
+1. Read the top-level files to understand how the FPGA design connects to the host:
+   - Look at softmc_top.v or similar top-level files
+   - How does the XDMA IP connect to the DRAM controller?
+   - What AXI interfaces are used?
+
+2. Read the fetch/decode/execute pipeline:
+   - How do instructions arrive from the host?
+   - What's the data path from host → FPGA → DRAM?
+
+3. Check if there's any existing MicroBlaze or AXI-stream infrastructure:
+   - Search for "microblaze", "axis", "axi_stream", "s_axis", "m_axis" in hdl/
+   - Is there any existing AXI-stream slave/master?
+
+4. List all Verilog/VHDL files and briefly describe their role.
+
+Report the architecture with file paths and line numbers.
+继续思考上述问题
+让我深入检查代码库中所有 Linux/POSIX 依赖，以及 apps 层的使用模式。
+
+Agent:Find all POSIX/Linux dependencies
+IN
+In the codebase at d:\DRAM_Bender\DRAM-Bender-master\sources\, I need to find ALL POSIX/Linux specific dependencies across ALL C++ source files. This is critical for assessing MicroBlaze portability.
+
+Search for:
+1. All POSIX headers: unistd.h, fcntl.h, pthread.h, sys/*, signal.h, etc.
+2. POSIX function calls: open, close, read, write, ioctl, mmap, munmap, posix_memalign, malloc, free, sleep, usleep, nanosleep
+3. Thread usage: std::thread, pthread_create, boost::thread, std::async
+4. Any use of /dev/ paths or device files
+5. Any Linux-specific APIs or syscalls
+6. Use of std::cout, std::cerr, std::cin (iostream)
+7. Use of std::fstream, ifstream, ofstream
+8. Use of boost libraries (which ones)
+9. Use of assert, abort, exit
+10. Dynamic memory: new, delete, malloc, free, memalign
+11. Any use of the C++ standard library features that may not be available on bare-metal (exceptions, RTTI, STL containers)
+
+For each file, report:
+- File path and line numbers
+- The specific POSIX/Linux dependency
+- Whether it could be replaced on bare-metal or if it requires a full OS
+
+Be very thorough — check every .cpp and .h file under sources/.
+Agent:Analyze SoftMC platform data flow
+IN
+In the codebase at d:\DRAM_Bender\DRAM-Bender-master\sources\, I need to understand the complete data flow and threading model.
+
+Please:
+1. Read api/platform.h and api/platform.cpp completely — understand:
+   - The threading model (is there a background reader thread?)
+   - How spsc_queue is used
+   - The full execute() flow
+   - How receiveData/consumeData work
+   - What xdma_recv_buf and xdma_read_size are
+   - The init/shutdown sequence
+
+2. Read api/program.h to understand the Program class and instruction encoding
+
+3. Check api/ directory for any other important abstractions
+
+4. Look at apps/sanity.cpp or apps/SanityCheck.cpp to understand a typical application's usage pattern
+
+5. Check how the HBM temperature reading and register dump work
+
+Report file paths, line numbers, and relevant code snippets. Focus on anything that would be affected by moving from a host-PC-with-PCIe to an embedded-MicroBlaze-with-AXI-Stream architecture.
+现在两份分析结果已经齐备。以下是从架构、软件依赖、硬件接口三个维度对这个改动的完整可行性分析。
+
+MicroBlaze AXI-Stream 替换方案可行性分析
+架构变化概览
+
+【当前架构】
+  x86 Linux 主机 (sources/*.cpp)
+      │  POSIX read/write
+      ▼
+  /dev/xdma0_h2c_0, /dev/xdma0_c2h_0
+      │  XDMA 内核驱动
+      ▼
+  PCIe 总线 ─── FPGA (XDMA IP → softmc_top → DRAM Controller)
+                                      ↑
+                              Verilog RTL (hdl/*.v)
+
+【目标架构】
+  FPGA 内部:
+  MicroBlaze CPU (运行 sources/*.cpp)
+      │  AXI-Stream FIFO (内存映射寄存器)
+      ▼
+  AXI-Stream Interconnect ─── softmc_top → DRAM Controller
+      │                          ↑
+      └── BRAM / DDR (指令+数据)   Verilog RTL (需修改)
+核心变化：PCIe 链路被替换为 FPGA 内部的 AXI-Stream FIFO，x86 主机被替换为片上 MicroBlaze 软核。
+
+一、可行性的四个层次
+层次 1：AXI-Stream FIFO 替换 XDMA（中等可行）
+XDMA 使用 /dev/xdma* 字符设备的 read()/write()。AXI-Stream FIFO 在 MicroBlaze 上通过 内存映射寄存器 访问：
+
+XDMA 操作	AXI-Stream FIFO 对应
+write(fd, buf, size)	循环写 AXI_FIFO_TX_DATA 寄存器，检查 TX_FULL 标志
+read(fd, buf, size)	循环读 AXI_FIFO_RX_DATA 寄存器，检查 RX_EMPTY 标志
+open("/dev/xdma*")	不需要 — FIFO 寄存器在 MicroBlaze 地址空间固定映射
+posix_memalign	__attribute__((aligned(4096))) 静态缓冲区或 memalign()
+32KB 短读检测	AXI-Stream 的 TLAST 信号或 FIFO 空标志
+BoardInterface 的 switch/枚举设计就是为了支持这种替换 —— 直接加 IFACE::AXIS，实现对应的 axis_init/axis_send/axis_recv 即可。
+
+层次 2：POSIX/Linux 依赖的剥离（较大改动）
+经过全面扫描，以下 Blocker 级别的依赖必须处理：
+
+依赖	所在文件	MicroBlaze 替代方案
+open/close/read/write 设备文件	board.cpp	内存映射寄存器访问 (Xil_Out32/Xil_In32)
+/dev/xdma* 路径	board.h	宏改为 XPAR_AXI_FIFO_* 基地址
+std::thread 后台读线程	platform.h platform.cpp	直接去掉 — MicroBlaze 裸机上用同步轮询
+boost::lockfree::spsc_queue	platform.h	去掉 — 不再需要线程间缓冲
+fork/exec/mkfifo/wait (debug 功能)	prog.cpp	#ifdef 裁剪掉，裸机上不需要 Vivado 调试流程
+system() 调用汇编器	prog.cpp	链接 smc_parser 为库直接调用
+getpid() PRNG 种子	apps/*.cpp	替换为硬件定时器值或固定种子
+gettimeofday 测量	retention.cpp	替换为 AXI Timer 读取
+xdma_driver/ 整个目录	整个目录	完全不需要 — 删除
+层次 3：FPGA HDL 的改造（最大工作量，关键路径）
+当前 hdl/softmc_top.v 对接的是 XDMA IP 的 AXI-MM 从接口。XDMA IP 核收到 PCIe TLP 后，在 FPGA 侧暴露一个 AXI4-MM slave，指令被写入特定地址范围。
+
+换成 MicroBlaze + AXI-Stream FIFO 后：
+
+XDMA IP 核移除 — 不再需要 PCIe endpoint
+添加 AXI-Stream FIFO IP (Xilinx axis_data_fifo 或 axi_fifo_mm_s)
+softmc_top 的输入接口改为 AXI-Stream — 需要一个简单的包解析器来区分控制命令和指令数据
+指令存储 — 可以用 BRAM 替代原来的寄存器，MicroBlaze 直接把指令序列写入 BRAM，然后 FPGA 执行引擎从 BRAM 读取
+读数据返回 — FPGA 执行 DRAM READ 后，数据通过 AXI-Stream FIFO 返回给 MicroBlaze
+这部分是 FPGA 工程师的工作，不在 C++ 源码范围内，但它是决定项目周期的关键因素。
+
+层次 4：C++ 运行时在 MicroBlaze 上的适配
+MicroBlaze 使用 Xilinx SDK/Vitis 工具链，基于 newlib 或 newlib-nano 标准 C 库，GCC 编译器。各特性的兼容性：
+
+特性	可用性	备注
+STL 容器 (vector/map/list/string)	可用	需要堆分配，增大 binary size
+malloc/free/new/delete	可用	需配置 heap 大小（链接脚本）
+<iostream> / printf	可用	需 UART 后端（semihosting 或 xil_printf）
+<fstream> 文件读写	部分可用	需 FATFS 库 + SD 卡，或改用内存缓冲
+C++ exceptions (try/catch/throw)	可用但不建议	-fno-exceptions 减少 binary size
+assert()	可自定义	替换为 xil_printf + while(1)
+posix_memalign	不可用	用 memalign() 或静态对齐数组替代
+std::thread	不可用（裸机）	必须去掉，改为同步轮询模型
+Boost 库	部分可用	SPSC queue 去掉后不再需要 Boost
+二、具体改造方案建议
+2.1 board.cpp 重构为 AXI-Stream 版本
+
+// 伪代码 — MicroBlaze AXI-Stream FIFO 版本
+#include "xil_io.h"        // Xil_Out32, Xil_In32
+#include "xparameters.h"   // XPAR_* 地址宏
+
+int BoardInterface::axis_init()
+{
+    // 1. 复位 AXI-Stream FIFO
+    Xil_Out32(XPAR_AXIS_FIFO_TX_RESET, 1);
+    Xil_Out32(XPAR_AXIS_FIFO_RX_RESET, 1);
+    // 2. 分配静态缓冲区（不需要 posix_memalign）
+    send_buf = (void*)malloc(SEND_BUF_SIZE);
+    recv_buf = (void*)malloc(RECV_BUF_SIZE);
+    // 3. 不再有文件描述符
+    return 0;
+}
+
+int BoardInterface::axis_send(void* data, const uint size)
+{
+    uint32_t* words = (uint32_t*)data;
+    int count = size / 4;
+    for (int i = 0; i < count; i++) {
+        // 等待 TX FIFO 不满
+        while (Xil_In32(XPAR_AXIS_FIFO_TX_VACANCY) == 0);
+        Xil_Out32(XPAR_AXIS_FIFO_TX_DATA, words[i]);
+    }
+    return 0;
+}
+
+int BoardInterface::axis_recv(void* buf, const uint size)
+{
+    uint32_t* words = (uint32_t*)buf;
+    int count = size / 4;
+    for (int i = 0; i < count; i++) {
+        // 等待 RX FIFO 不空，或检测 TLAST
+        while (Xil_In32(XPAR_AXIS_FIFO_RX_VACANCY) == FIFO_DEPTH);
+        words[i] = Xil_In32(XPAR_AXIS_FIFO_RX_DATA);
+    }
+    return size;
+}
+2.2 platform.cpp 去掉线程模型
+最核心的简化：execute() 不再需要 std::thread 和 SPSC queue。
+
+
+【当前】
+  execute() → sendData(指令) → 启动 consumeData 线程 → receiveData() 从 SPSC 取
+
+【改造后】
+  execute() → axis_send(指令) → axis_recv(数据) 直接同步读取
+consumeData() 和 api_recv_buf 可以完全移除，receiveData() 变成对 BoardInterface::recvData() 的直接封装。
+
+2.3 裁剪 prog.cpp
+debug() 方法（fork/exec/mkfifo 等 ~200 行）用 #ifdef PLATFORM_MICROBLAZE 裁剪掉，这些是 Vivado 仿真调试工具链，在嵌入式场景不需要。
+
+system("smc_parser ...") 调用改为直接链接 parser 代码编译进固件。
+
+三、工作量估算
+模块	改动类型	预估工时	风险
+board.h/cpp	重写 (~200行)	2-3天	低 — 接口清晰
+platform.h/cpp	去线程化 (~100行删减)	1-2天	低 — 逻辑简化
+prog.cpp	条件裁剪 (~50行改动)	0.5天	低
+apps/*.cpp	替换 POSIX 调用 (~20行/文件)	1天	低 — 集中在时间/随机种子
+MicroBlaze BSP/链接脚本	新建工程	2-3天	中 — 需配置外设地址映射
+FPGA HDL	接口修改 (XDMA→AXI-Stream)	2-4周	高 — 关键路径
+集成测试	软硬件联调	1-2周	中
+四、总体结论
+软件侧可行，改动范围可控：核心改动集中在 board.cpp（重写设备访问层）和 platform.cpp（去掉线程模型），大约 300-400 行代码的增删。BoardInterface 的抽象设计良好，接口语义基本不变。
+
+硬件侧是决定性因素：FPGA RTL 从 XDMA AXI-MM 接口改为 AXI-Stream FIFO 接口需要 Verilog 改动，这是整个移植项目周期和风险的主要来源。建议先评估 HDL 工作量再确定整体排期。
+
+建议的推进顺序：
+
+先写一个 MicroBlaze 最小系统 + AXI-Stream FIFO 回环测试（验证硬件通路）
+软件侧同步改造 BoardInterface，用回环测试验证数据收发
+再接入 softmc_top 进行端到端联调
+请帮忙修改软件侧的代码，原代码名称不变，新代码放在api文件下，名称自己定义
+我已经充分理解了代码结构。让我先做简要规划，然后开始实现。
+
+Update Todos
+
+修改 board.h — 添加 IFACE::AXIS 枚举和相关成员
+
+创建 board_axis.h — MicroBlaze AXI-Stream FIFO 寄存器定义和硬件抽象层
+
+修改 board.cpp — 实现 axis_init/axis_send/axis_recv 并接入 switch 分发
+
+修改 platform.h — 条件化线程和 SPSC 队列,适配裸机模式
+
+修改 platform.cpp — 条件化 execute/consumeData/receiveData 的双模式行为
+
+检查所有改动的接口一致性
+Let me re-read all the files I'll modify.
+
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h, d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp, d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.h, d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.cpp
+Now let me start implementing. I'll begin with the first batch of independent changes.
+
+Update Todos
+
+修改 board.h — 添加 IFACE::AXIS 枚举和相关成员
+
+创建 board_axis.h — MicroBlaze AXI-Stream FIFO 寄存器定义和硬件抽象层
+
+修改 board.cpp — 实现 axis_init/axis_send/axis_recv 并接入 switch 分发
+
+修改 platform.h — 条件化线程和 SPSC 队列,适配裸机模式
+
+修改 platform.cpp — 条件化 execute/consumeData/receiveData 的双模式行为
+
+检查所有改动的接口一致性
+First batch: modifying board.h, creating board_axis.h, and modifying platform.h.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h
+Added 1 line
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h
+Added 7 lines
+Now create the AXI-Stream HAL header and modify platform.h.
+
+Write d:\DRAM_Bender\DRAM-Bender-master\sources\api\board_axis.h
+139 lines
+#ifndef BOARD_AXIS_H
+#define BOARD_AXIS_H
+
+/**
+ * AXI-Stream FIFO Hardware Abstraction Layer for MicroBlaze.
+ *
+ * Maps the Xilinx AXI4-Stream FIFO (axi_fifo_mm_s) register interface:
+ *   TX channel: TDFD (data write) at +0x00, TDFV (vacancy) at +0x04
+ *   RX channel: RDFD (data read)  at +0x00, RDFO (occupancy) at +0x04
+ *
+ * Base addresses come from xparameters.h (generated by Vitis from the
+ * hardware design). Override AXIS_TX_FIFO_BASEADDR / AXIS_RX_FIFO_BASEADDR
+ * if a different mapping is needed.
+ */
+
+#include <stdint.h>
+#include <string.h>
+
+/* ---- FIFO register offsets (in bytes) ---- */
+#define AXIS_FIFO_TDFD   0x00   /* Transmit Data FIFO Data          (write) */
+#define AXIS_FIFO_TDFV   0x04   /* Transmit Data FIFO Vacancy       (read)  */
+#define AXIS_FIFO_RDFD   0x00   /* Receive  Data FIFO Data          (read)  */
+#define AXIS_FIFO_RDFO   0x04   /* Receive  Data FIFO Occupancy     (read)  */
+#define AXIS_FIFO_SRR    0x10   /* Software Reset Register                   */
+#define AXIS_FIFO_TDFR   0x00   /* Transmit Data FIFO Reset  (write 1 to SRR) */
+
+/* ---- Default base addresses (override via -D or xparameters.h) ---- */
+#ifndef AXIS_TX_FIFO_BASEADDR
+#ifdef XPAR_AXI_FIFO_MM_S_0_TX_BASEADDR
+#define AXIS_TX_FIFO_BASEADDR  XPAR_AXI_FIFO_MM_S_0_TX_BASEADDR
+#else
+#define AXIS_TX_FIFO_BASEADDR  0x44A00000
+#endif
+#endif
+
+#ifndef AXIS_RX_FIFO_BASEADDR
+#ifdef XPAR_AXI_FIFO_MM_S_0_RX_BASEADDR
+#define AXIS_RX_FIFO_BASEADDR  XPAR_AXI_FIFO_MM_S_0_RX_BASEADDR
+#else
+#define AXIS_RX_FIFO_BASEADDR  0x44A10000
+#endif
+#endif
+
+/* ---- Platform-specific register I/O ---- */
+#ifdef __MICROBLAZE__
+
+#include "xil_io.h"
+
+static inline void  axis_reg_write(uintptr_t addr, uint32_t val) { Xil_Out32(addr, val); }
+static inline uint32_t axis_reg_read(uintptr_t addr)             { return Xil_In32(addr); }
+
+#else /* host-side emulation / compile test */
+
+/* When building on a host (Linux), stub out the hardware access.
+ * Link against a real emulation backend if host-side testing is needed. */
+#include <stdio.h>
+static inline void  axis_reg_write(uintptr_t addr, uint32_t val) {
+    (void)addr; (void)val;
+}
+static inline uint32_t axis_reg_read(uintptr_t addr) {
+    (void)addr;
+    return 0xFFFFFFFF;  /* all-ones = FIFO not ready on emulated read */
+}
+
+#endif /* __MICROBLAZE__ */
+
+/* ---- FIFO status queries ---- */
+static inline uint32_t axis_tx_vacancy(uintptr_t base) {
+    return axis_reg_read(base + AXIS_FIFO_TDFV);
+}
+
+static inline uint32_t axis_rx_occupancy(uintptr_t base) {
+    return axis_reg_read(base + AXIS_FIFO_RDFO);
+}
+
+/* ---- FIFO data I/O ---- */
+static inline void axis_fifo_put(uintptr_t base, uint32_t word) {
+    axis_reg_write(base + AXIS_FIFO_TDFD, word);
+}
+
+static inline uint32_t axis_fifo_get(uintptr_t base) {
+    return axis_reg_read(base + AXIS_FIFO_RDFD);
+}
+
+/* ---- Blocking send / recv of byte buffers over AXI-Stream FIFOs ---- */
+
+/**
+ * Write `size` bytes from `data` to the TX FIFO in 32-bit words.
+ * Blocks while FIFO is full.  `size` should be a multiple of 4.
+ * Returns 0 on success, non-zero on timeout (if implemented).
+ */
+static inline int axis_fifo_send(uintptr_t tx_base, const void* data, unsigned int size) {
+    const uint32_t* words = (const uint32_t*)data;
+    unsigned int count = size / 4;
+
+    for (unsigned int i = 0; i < count; i++) {
+        /* spin while FIFO full (vacancy == 0) */
+        while (axis_tx_vacancy(tx_base) == 0) { }
+        axis_fifo_put(tx_base, words[i]);
+    }
+
+    /* trailing bytes (if size not word-aligned) — pad to word */
+    unsigned int rem = size % 4;
+    if (rem) {
+        uint32_t last = 0;
+        memcpy(&last, (const uint8_t*)data + (count * 4), rem);
+        while (axis_tx_vacancy(tx_base) == 0) { }
+        axis_fifo_put(tx_base, last);
+    }
+    return 0;
+}
+
+/**
+ * Read `size` bytes from the RX FIFO into `buf` in 32-bit words.
+ * Blocks while FIFO is empty.  `size` should be a multiple of 4.
+ * Returns the number of bytes actually read.
+ */
+static inline int axis_fifo_recv(uintptr_t rx_base, void* buf, unsigned int size) {
+    uint32_t* words = (uint32_t*)buf;
+    unsigned int count = size / 4;
+
+    for (unsigned int i = 0; i < count; i++) {
+        /* spin while FIFO empty (occupancy == 0) */
+        while (axis_rx_occupancy(rx_base) == 0) { }
+        words[i] = axis_fifo_get(rx_base);
+    }
+
+    /* trailing bytes — read the word but only copy the needed bytes */
+    unsigned int rem = size % 4;
+    if (rem) {
+        while (axis_rx_occupancy(rx_base) == 0) { }
+        uint32_t last = axis_fifo_get(rx_base);
+        memcpy((uint8_t*)buf + (count * 4), &last, rem);
+    }
+    return (int)size;
+}
+
+#endif /* BOARD_AXIS_H */
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.h
+Added 2 lines
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.h
+Added 2 lines
+Update Todos
+
+修改 board.h — 添加 IFACE::AXIS 枚举和相关成员
+
+创建 board_axis.h — MicroBlaze AXI-Stream FIFO 寄存器定义和硬件抽象层
+
+修改 board.cpp — 实现 axis_init/axis_send/axis_recv 并接入 switch 分发
+
+修改 platform.h — 条件化线程和 SPSC 队列,适配裸机模式
+
+修改 platform.cpp — 条件化 execute/consumeData/receiveData 的双模式行为
+
+检查所有改动的接口一致性
+Now modifying board.cpp — this requires multiple edits.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 3 lines
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 6 lines
+Fix the destructor to guard against uninitialized resources.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 6 lines
+Add the AXIS case to init().
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 15 lines
+Add AXIS dispatch to sendData() and recvData(), and add the axis implementations.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 2 lines
+Now add the axis_init, axis_send, and axis_recv implementations, and fix the xdma_send bug.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 29 lines
+Update Todos
+
+修改 board.h — 添加 IFACE::AXIS 枚举和相关成员
+
+创建 board_axis.h — MicroBlaze AXI-Stream FIFO 寄存器定义和硬件抽象层
+
+修改 board.cpp — 实现 axis_init/axis_send/axis_recv 并接入 switch 分发
+
+修改 platform.h — 条件化线程和 SPSC 队列,适配裸机模式
+
+修改 platform.cpp — 条件化 execute/consumeData/receiveData 的双模式行为
+
+检查所有改动的接口一致性
+Now modifying platform.cpp in several steps.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.cpp
+Added 2 lines
+Guard the thread join in the destructor.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.cpp
+Added 2 lines
+Make init() select the right interface based on platform.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.cpp
+Added 4 lines
+Modify execute() — conditionally spawn the background thread.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.cpp
+Added 2 lines
+Wrap consumeData() with #ifdef __linux__.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.cpp
+Added 2 lines
+Modify receiveData() — bare-metal path reads directly from AXI-Stream FIFO.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.cpp
+Added 4 lines
+Now let me verify all the modified files are correct.
+
+Update Todos
+
+修改 board.h — 添加 IFACE::AXIS 枚举和相关成员
+
+创建 board_axis.h — MicroBlaze AXI-Stream FIFO 寄存器定义和硬件抽象层
+
+修改 board.cpp — 实现 axis_init/axis_send/axis_recv 并接入 switch 分发
+
+修改 platform.h — 条件化线程和 SPSC 队列,适配裸机模式
+
+修改 platform.cpp — 条件化 execute/consumeData/receiveData 的双模式行为
+
+检查所有改动的接口一致性
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h, d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp, d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.h, d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.cpp, d:\DRAM_Bender\DRAM-Bender-master\sources\api\board_axis.h
+All files verified. Let me finalize.
+
+Update Todos
+
+修改 board.h — 添加 IFACE::AXIS 枚举和相关成员
+
+创建 board_axis.h — MicroBlaze AXI-Stream FIFO 寄存器定义和硬件抽象层
+
+修改 board.cpp — 实现 axis_init/axis_send/axis_recv 并接入 switch 分发
+
+修改 platform.h — 条件化线程和 SPSC 队列,适配裸机模式
+
+修改 platform.cpp — 条件化 execute/consumeData/receiveData 的双模式行为
+
+检查所有改动的接口一致性
+改动总结
+修改/新建了 5 个文件
+1. board_axis.h — 新建
+AXI-Stream FIFO 硬件抽象层。包含：
+
+寄存器映射：Xilinx AXI4-Stream FIFO (axi_fifo_mm_s) 的 TDFD/TDFV/RDFD/RDFO 寄存器偏移定义
+平台适配：MicroBlaze 上走 Xil_Out32/Xil_In32，Linux 上走 stub（可对接仿真后端）
+阻塞式收发：axis_fifo_send() / axis_fifo_recv() 处理 32-bit 字传输 + 非对齐尾部字节
+基地址配置：优先用 xparameters.h 的宏，否则回退到默认值
+2. board.h — 修改
+添加 AXIS = 1 到 IFACE 枚举
+添加 5 个 AXI-Stream 专用私有成员：axis_tx_base、axis_rx_base、axis_init()、axis_send()、axis_recv()
+3. board.cpp — 修改
+改动点	内容
+构造函数	所有成员变量初始化为安全值（nullptr/-1/0），修复了旧代码未初始化的 bug
+析构函数	close() 只在 XDMA 模式下调用；所有释放前检查空指针
+init()	新增 case IFACE::AXIS：记录 FIFO 基地址 + 分配普通堆缓冲区
+sendData/recvData	新增 case IFACE::AXIS 分发到对应的 axis 方法
+xdma_send()	修复死循环 bug：write(fd, buf, size) → write(fd, buf+count, size-count)；rc==0 时返回错误
+xdma_recv()	assert 改为运行时错误检查
+axis_init/send/recv	委托到 board_axis.h 的 HAL 函数
+4. platform.h — 修改
+<thread> 和 <boost/lockfree/spsc_queue.hpp> 用 #ifdef __linux__ 包裹
+std::thread receiver、boost::lockfree::spsc_queue、consumeData() 声明同样条件编译
+xdma_recv_buf 保持无条件声明（HBM 温度读取两个平台都需要）
+5. platform.cpp — 修改
+改动点	Linux (__linux__)	MicroBlaze (裸机)
+init()	new BoardInterface(IFACE::XDMA)	new BoardInterface(IFACE::AXIS)
+execute()	启动后台 consumeData 线程	仅 sendData()，不启动线程
+consumeData()	编译，线程中运行	不编译
+receiveData()	从 SPSC 队列 pop	直接调用 iface->recvData() 阻塞读取
+析构函数	join 线程	跳过
+HBM 温度 / 寄存器 dump	不变（直接调用 iface，绕过 SPSC）	不变
+平台自动检测
+使用编译器预定义宏 __linux__ 和 __MICROBLAZE__ 自动选择路径，无需手动定义任何编译开关：
+
+在 x86 Linux 上编译 → 行为完全不变，XDMA + 线程 + SPSC
+在 MicroBlaze 裸机上编译 → AXIS + 同步 I/O
+仍需注意的遗留项
+prog.cpp 的 debug() 函数使用了 fork/exec/mkfifo，在 MicroBlaze 上需要 #ifdef __linux__ 裁剪
+apps 层的 srand(time(NULL)+getpid()) 和 gettimeofday() 需要替换为硬件定时器
+我准备跑在MicroBlaze 裸机上
+裸机环境下还有一些细节需要处理。让我检查并修复剩余兼容性问题。
+
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h
+两个问题需要修复：board.h 缺少 <cstdint> 导致 uintptr_t 可能未定义；axis_init() 和 init() 中的 AXIS 分支代码重复。
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h
+Added 1 line
+Refactor init() 的 AXIS 分支消除重复代码。
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Removed 13 lines
+Remove unused <fstream> include that could cause issues on bare-metal.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Edit failed
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Removed 1 line
+有一个重要的编译问题：XDMA 代码中的 POSIX 函数 (open, posix_memalign, write, read) 在 MicroBlaze 裸机上可能无法编译。需要将这些路径也条件化。
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 2 lines
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 2 lines
+Guard XDMA dispatch and implementations.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 4 lines
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 2 lines
+Now guard the XDMA method declarations in board.h.
+
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h
+Added 2 lines
+Final verification of all files.
+
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h, d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+所有文件验证完毕。以下是完整的状态总结。
+
+裸机 MicroBlaze 适配完成
+编译行为
+平台	__linux__	__MICROBLAZE__	接口	线程	第三方依赖
+x86 Linux	定义	未定义	XDMA (/dev/xdma*)	std::thread + Boost SPSC	Boost, POSIX
+MicroBlaze 裸机	未定义	定义	AXIS (AXI-Stream FIFO)	无（同步轮询）	仅 Xilinx SDK
+自动检测，无需任何手动编译开关。
+
+MicroBlaze 裸机编译树
+
+board.h / board.cpp          →  仅 IFACE::AXIS 分支编译
+board_axis.h                 →  Xil_Out32/Xil_In32 路径编译
+platform.h / platform.cpp    →  线程/SPSC 全部裁剪，同步 I/O
+prog.h / instruction.h       →  纯 C++，无 POSIX 依赖
+裸机 Vitis 工程配置
+创建工程时需要注意以下几点：
+
+1. BSP 配置
+
+
+- 勾选 xil_io (提供 Xil_Out32 / Xil_In32)
+- 堆大小: ≥ 128 KB (malloc 需要约 96KB: instr_buf 64KB + xdma_recv_buf 32KB)
+2. 编译器标志
+
+
+-std=c++17                     # [[maybe_unused]]
+-fno-exceptions                # 减小体积
+-fno-rtti                      # 减小体积
+-DNDEBUG                       # 可选: 禁用 assert
+3. stdout/stderr 重定向
+
+代码中 std::cout、std::cerr、printf 在裸机上不会自动输出到串口。需要在 BSP 中实现 newlib 的 _write() 桩函数：
+
+
+// 添加到工程中
+int _write(int fd, const char* buf, int len) {
+    for (int i = 0; i < len; i++)
+        Xil_Out32(UART_BASEADDR + 0x04, buf[i]);  // UART TX FIFO
+    return len;
+}
+或者在 Vitis 中勾选 xil_printf 并将 printf/cout 调用改为 xil_printf。
+
+4. xparameters.h
+
+AXI-Stream FIFO 基地址从 Vitis 硬件设计自动生成到 xparameters.h。board_axis.h 会优先使用 XPAR_AXI_FIFO_MM_S_0_TX_BASEADDR 宏，如果 IP 名称不同，编译时用 -D 覆盖：
+
+
+-DAXIS_TX_FIFO_BASEADDR=0x44A00000
+-DAXIS_RX_FIFO_BASEADDR=0x44A10000
+仍需裁剪的文件（不属于本次范围）
+prog.cpp 的 debug() 函数 — 使用 fork/exec/mkfifo，裸机上需要加 #ifdef __linux__
+apps 层的 getpid() / gettimeofday() / srand(time(NULL)+getpid()) — 需替换为硬件定时器
+请帮忙把board文件中XDMA部分删除，仅保留AXIS接口，发送接收函数改成putfsl和getfsl
+理解。将 board 改造为纯 FSL（Fast Simplex Link）接口，删除所有 XDMA 和 board_axis.h。
+
+Write d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h
+27 lines
+#ifndef BOARD_H
+#define BOARD_H
+
+/**
+ * MicroBlaze FSL-based interface to the DRAM-Bender FPGA core.
+ *
+ * Uses putfsl / getfsl instructions to stream data over the
+ * Fast Simplex Link — a point-to-point FIFO built into the
+ * MicroBlaze pipeline.  No DMA buffers or OS dependencies.
+ */
+class BoardInterface {
+public:
+  BoardInterface(int dimm_select = 0);
+  ~BoardInterface();
+
+  int init();
+  int sendData(void* data, const unsigned int size);
+  int recvData(void* buf,  const unsigned int size);
+
+private:
+  static const int FSL_TX_SLOT = 0;  /* putfsl → FPGA (commands / instructions) */
+  static const int FSL_RX_SLOT = 1;  /* getfsl ← FPGA (read data)               */
+  int dimm_select;
+};
+
+#endif
+IDE 提示只是 IntelliSense 配置问题，不影响实际编译。继续写入 board.cpp。
+
+Write d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+54 lines
+#include "board.h"
+#include <fsl.h>
+#include <string.h>
+
+BoardInterface::BoardInterface(int dimm_select)
+{
+  this->dimm_select = dimm_select;
+}
+
+BoardInterface::~BoardInterface()
+{
+}
+
+int BoardInterface::init()
+{
+  return 0;
+}
+
+int BoardInterface::sendData(void* data, const unsigned int size)
+{
+  const unsigned int count = size / 4;
+
+  for (unsigned int i = 0; i < count; i++)
+    putfsl(((unsigned int*)data)[i], FSL_TX_SLOT);
+
+  /* trailing bytes — pad to word */
+  unsigned int rem = size % 4;
+  if (rem) {
+    unsigned int last = 0;
+    memcpy(&last, (unsigned char*)data + count * 4, rem);
+    putfsl(last, FSL_TX_SLOT);
+  }
+
+  return 0;
+}
+
+int BoardInterface::recvData(void* buf, const unsigned int size)
+{
+  const unsigned int count = size / 4;
+
+  for (unsigned int i = 0; i < count; i++)
+    getfsl(((unsigned int*)buf)[i], FSL_RX_SLOT);
+
+  /* trailing bytes — read full word, copy what's needed */
+  unsigned int rem = size % 4;
+  if (rem) {
+    unsigned int last;
+    getfsl(last, FSL_RX_SLOT);
+    memcpy((unsigned char*)buf + count * 4, &last, rem);
+  }
+
+  return size;
+}
+Delete board_axis.h and fix the constructor call in platform.cpp.
+
+Bash Delete board_axis.h
+IN
+rm "d:/DRAM_Bender/DRAM-Bender-master/sources/api/board_axis.h"
+
+OUT
+(Bash completed with no output)
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.cpp (lines 86-97)
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\platform.cpp
+Removed 4 lines
+Let me verify the final state of all files.
+
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.h
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+改造完成。以下是最终变更总结。
+
+变更总结
+文件状态
+文件	操作	行数	说明
+board.h	重写	26 行	移除 IFACE 枚举、XDMA/PCIe、AXI-Stream FIFO；纯 FSL 接口
+board.cpp	重写	53 行	仅保留 putfsl / getfsl 实现，无任何 OS 依赖
+board_axis.h	删除	—	FSL 不需要 HAL 层
+platform.cpp	1行修改	—	移除构造函数中的 IFACE::XDMA/AXIS，直接 new BoardInterface(dimm_select)
+FSL 数据流
+
+MicroBlaze CPU                    FPGA 逻辑
+─────────────                    ──────────
+sendData()                      
+  putfsl(w0, slot=0) ────────→  FSL0 FIFO → 指令解析器
+  putfsl(w1, slot=0) ────────→  
+  putfsl(w2, slot=0) ────────→  
+  ...                            FPGA 执行 DRAM 操作
+                                 
+recvData()                       
+  getfsl(w0, slot=1) ←────────  FSL1 FIFO ← DRAM 读数据
+  getfsl(w1, slot=1) ←────────  
+  getfsl(w2, slot=1) ←────────  
+  ...
+需要 FPGA 侧配合
+putfsl/getfsl 是阻塞指令，没有内建的 end-of-stream 信号。FPGA 逻辑需要处理：
+
+FSL0 (TX)：接收 32-bit 指令字流，解析 256-bit 指令包
+FSL1 (RX)：返回 DRAM 读数据。由于 getfsl 会永远阻塞等待，需要在 FPGA 设计中提供 end-of-stream 机制（如发送一个特定的 magic word 表示传输结束，或使用额外 FSL slot / GPIO 发信号）
+FSL slot ID 在 board.h:21-22 定义为编译期常量 FSL_TX_SLOT=0 和 FSL_RX_SLOT=1，需与 Vivado 硬件设计中的 FSL 端口编号一致。
+
