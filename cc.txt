@@ -984,3 +984,116 @@ FSL0 (TX)：接收 32-bit 指令字流，解析 256-bit 指令包
 FSL1 (RX)：返回 DRAM 读数据。由于 getfsl 会永远阻塞等待，需要在 FPGA 设计中提供 end-of-stream 机制（如发送一个特定的 magic word 表示传输结束，或使用额外 FSL slot / GPIO 发信号）
 FSL slot ID 在 board.h:21-22 定义为编译期常量 FSL_TX_SLOT=0 和 FSL_RX_SLOT=1，需与 Vivado 硬件设计中的 FSL 端口编号一致。
 
+board.cpp是C++文件，putfsl和getfsl是C语言函数接口，这样直接调用可以吗
+好问题。<fsl.h> 是 C 头文件，在 C++ 中直接 include 可能有名字改编 (name mangling) 问题。需要用 extern "C" 包裹。
+
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Edit d:\DRAM_Bender\DRAM-Bender-master\sources\api\board.cpp
+Added 3 lines
+修复完成。说明一下情况：
+
+putfsl/getfsl 本质是宏，不是函数。 在 Xilinx <fsl.h> 中它们是这样定义的：
+
+
+#define putfsl(val, id)  __asm__ __volatile__ ("put  %0, rfsl" #id :: "r"(val))
+#define getfsl(val, id)  __asm__ __volatile__ ("get  %0, rfsl" #id : "=r"(val))
+宏由预处理器展开，不受 C++ 名字改编影响。所以原来的写法在大多数情况下实际能编译通过。
+
+但 <fsl.h> 内部可能还声明了其他辅助函数或内联函数，没有 extern "C" 保护的话会有链接问题。加 extern "C" 是 C++ 调用 C 头文件的标准防御性写法，确保万无一失。
+
+另外，如果某个 MicroBlaze 工具链没有 <fsl.h>（某些版本只用编译器 builtin），可以改用内置函数，无需头文件：
+
+
+#define fsl_put(val, id)  __builtin_microblaze_putfsl((val), (id))
+#define fsl_get(val, id)  __builtin_microblaze_getfsl((val), (id))
+当前用的是 <fsl.h> 方式，这是 Xilinx 官方文档推荐的标准做法。
+
+API文件夹下的C++文件可以直接跑在microblaze 裸机上吗，可以直接把这个文件夹放到SDK的helloword的source文件下编译运行吗，需不需要考虑打印cout(C++)和printf(C语言)的兼容性问题
+让我全面检查 api 文件夹下所有文件的裸机兼容性。
+
+Agent:Check API files for bare-metal issues
+IN
+In the directory d:\DRAM_Bender\DRAM-Bender-master\sources\api\, I need to identify ALL remaining issues that would prevent these C++ files from compiling and running on MicroBlaze bare-metal (no OS, using Xilinx Vitis/SDK with newlib).
+
+Please read these files completely:
+- platform.h
+- platform.cpp
+- prog.h
+- prog.cpp
+- instruction.h
+- instruction.cpp
+- api/pySoftMC/pySoftMC.cpp (just check if it's in the build path)
+
+For EACH file, report:
+1. All `std::cout`, `std::cerr`, `printf`, `fprintf` calls — these need stdout/stderr backend on bare-metal
+2. All `#include` of POSIX/Linux headers (unistd.h, fcntl.h, sys/*, pthread.h, etc.)
+3. All POSIX function calls (fork, exec, open, close, read, write, system, mkfifo, dup2, getpid, etc.)
+4. Any `#ifdef __linux__` guards and whether they fully isolate Linux-specific code
+5. Any `malloc`/`free`/`new`/`delete` calls (need heap configured in linker script)
+6. Any `assert()` calls (need _write stub or -DNDEBUG)
+7. Any Boost usage
+8. Any std::thread usage
+
+Be thorough — this determines whether the code can be dropped directly into a Vitis helloworld project.
+Read d:\DRAM_Bender\DRAM-Bender-master\sources\api\pySoftMC\pySoftMC.cpp
+Globpattern: "**/Makefile*"
+Found 2 files
+Bash List lexyacc directory
+IN
+ls -la "d:/DRAM_Bender/DRAM-Bender-master/sources/api/lexyacc/"
+
+OUT
+total 28
+drwxr-xr-x 1 w_jim 197609    0 Aug 10  2025 .
+drwxr-xr-x 1 w_jim 197609    0 May 28 21:46 ..
+-rw-r--r-- 1 w_jim 197609  761 Aug 10  2025 Makefile
+-rw-r--r-- 1 w_jim 197609 2080 Aug 10  2025 example.smc
+-rw-r--r-- 1 w_jim 197609 1691 Aug 10  2025 smc.l
+-rw-r--r-- 1 w_jim 197609 8568 Aug 10  2025 smc.y
+Grep "SMC_ZQ" (in d:\DRAM_Bender\DRAM-Bender-master\sources)
+2 lines of output
+分析完毕。答案是：不能直接全部丢进去，需要分文件处理。
+
+api/ 各文件裸机兼容性
+文件	可编译	问题
+board.h / board.cpp	直接可用	无
+instruction.h / instruction.cpp	需要 _write 桩	~45 处 printf 做指令反汇编打印
+platform.h / platform.cpp	需要 _write 桩 + 配置堆	__linux__ 守卫已隔离线程/Boost，裸机走 FSL 路径
+prog.cpp	不能编译	fork/exec/system/mkfifo/dup2/wait 裸机上没有
+pySoftMC/pySoftMC.cpp	排除	Python 绑定，有独立 Makefile
+cout (C++) 和 printf (C) 的兼容性
+二者在裸机上走的是同一条路——都需要你提供 _write() 桩函数。
+
+
+std::cout << "hello"   ──┐
+                         ├──→ newlib write() ──→ _write(fd, buf, len) ──→ ???
+printf("hello")        ──┘
+MicroBlaze 裸机上，_write() 默认是一个空桩（返回 -1），所以 cout 和 printf 都能编译通过，但输出会被丢弃，不会打印到任何地方。
+
+要看到输出，需要在工程里实现 _write()：
+
+
+// 添加到 Vitis 工程中
+#include <xil_io.h>
+
+int _write(int fd, const char* buf, int len) {
+    for (int i = 0; i < len; i++) {
+        // 轮询等待 UART TX FIFO 有空位
+        while (Xil_In32(UART_BASEADDR + 0x2C) & 0x08);
+        // 发送一个字节
+        Xil_Out32(UART_BASEADDR + 0x30, buf[i]);
+    }
+    return len;
+}
+Vitis 的 helloworld 模板通常自带这个桩（在 syscall.c 或 BSP 中）。如果你的工程里已经有它，那 cout 和 printf 都能正常工作，不需要做任何区分。
+
+三种处理策略
+策略	做法	适用场景
+A. 保留输出	提供 _write 桩 → UART	开发调试阶段，需要看打印
+B. 替换为 xil_printf	printf → xil_printf，cout → 删除或改为 xil_printf	需要输出但不想配置 newlib
+C. 禁用输出	编译加 -DNDEBUG，不管 cout/printf 静默丢弃	发布固件，不需要打印
+立即可用的最小文件集
+如果只做最基本的 MicroBlaze 工程，你需要处理 prog.cpp 的 POSIX 依赖。debug() 函数（约 200 行，用到 fork/exec/mkfifo/dup2/wait）和 system() 调用是 Vivado 仿真调试工具链用的，裸机上完全不需要。
+
+需要我帮你在 prog.cpp 里用 #ifdef 把这部分裁剪掉吗？这样 api 下的所有文件就都能直接放进 Vitis 工程编译了。
+
