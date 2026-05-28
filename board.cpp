@@ -1,6 +1,9 @@
 #include "board.h"
-#include <fsl.h>
 #include <string.h>
+
+extern "C" {
+#include <fsl.h>
+}
 
 BoardInterface::BoardInterface(int dimm_select)
 {
